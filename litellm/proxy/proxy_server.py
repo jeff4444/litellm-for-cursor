@@ -8523,6 +8523,10 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
             intermediate.append({"role": role or "user", "content": converted_content})
         else:
             # Fallback: pass item through
+            verbose_proxy_logger.warning(
+                "cursor_compat: input item fell through conversion — type=%r role=%r keys=%s",
+                item.get("type"), item.get("role"), list(item.keys()),
+            )
             intermediate.append(item)
 
     # Second pass: merge consecutive function_call items into the preceding
