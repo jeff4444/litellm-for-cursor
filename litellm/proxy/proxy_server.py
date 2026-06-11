@@ -8434,6 +8434,195 @@ async def model_info(
     )
 
 
+def _convert_responses_input_to_messages(input_list: list) -> list:
+    """
+    Convert OpenAI Responses API 'input' list to Chat Completions 'messages' format.
+
+    Handles all item types observed in Cursor's Responses API requests:
+    - Regular message items: {"role": "...", "content": [...]}
+    - function_call items (assistant tool invocations): {"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}
+    - function_call_output items (tool results): {"type": "function_call_output", "call_id": "...", "output": ...}
+    - assistant messages with output_text content: {"role": "assistant", "content": [{"type": "output_text", ...}]}
+
+    The key insight: in the Responses API, assistant text and function_call items are
+    separate entries. In Chat Completions, they must be merged into one assistant message
+    with both content and tool_calls. We do a two-pass approach: collect all
+    function_calls that follow an assistant text, merge them into that message.
+    """
+    # First pass: normalize each item into an intermediate representation
+    intermediate = []
+    for item in input_list:
+        if not isinstance(item, dict):
+            intermediate.append({"role": "user", "content": str(item)})
+            continue
+
+        item_type = item.get("type")
+        role = item.get("role")
+
+        # Bare function_call item (no role): assistant tool invocation
+        if item_type == "function_call" and role is None:
+            intermediate.append({
+                "_type": "function_call",
+                "call_id": item.get("call_id", ""),
+                "name": item.get("name", ""),
+                "arguments": item.get("arguments", "{}"),
+            })
+            continue
+
+        # Bare function_call_output item (no role): tool result
+        if item_type == "function_call_output" and role is None:
+            # output can be a string or a list of content parts
+            raw_output = item.get("output", "")
+            if isinstance(raw_output, list):
+                # Extract text from content parts
+                parts = []
+                for part in raw_output:
+                    if isinstance(part, dict):
+                        parts.append(part.get("text", str(part)))
+                    else:
+                        parts.append(str(part))
+                output_str = "\n".join(parts)
+            else:
+                output_str = str(raw_output)
+            intermediate.append({
+                "_type": "function_call_output",
+                "call_id": item.get("call_id", ""),
+                "content": output_str,
+            })
+            continue
+
+        # Message item with a role
+        content = item.get("content")
+        if isinstance(content, str):
+            intermediate.append({"role": role or "user", "content": content})
+        elif isinstance(content, list):
+            converted_content = []
+            for part in content:
+                if not isinstance(part, dict):
+                    converted_content.append(part)
+                    continue
+                part_type = part.get("type", "")
+                if part_type == "input_text":
+                    converted_content.append({"type": "text", "text": part.get("text", "")})
+                elif part_type == "output_text":
+                    # Assistant response text
+                    converted_content.append({"type": "text", "text": part.get("text", "")})
+                elif part_type == "input_image":
+                    img_data = {}
+                    for key in ("image_url", "url", "file_id"):
+                        if key in part:
+                            img_data["url"] = part[key]
+                            break
+                    converted_content.append({"type": "image_url", "image_url": img_data})
+                else:
+                    converted_content.append(part)
+            intermediate.append({"role": role or "user", "content": converted_content})
+        else:
+            # Fallback: pass item through
+            intermediate.append(item)
+
+    # Second pass: merge consecutive function_call items into the preceding
+    # assistant message, and emit function_call_output as tool messages.
+    messages = []
+    i = 0
+    while i < len(intermediate):
+        item = intermediate[i]
+
+        if item.get("_type") == "function_call":
+            # Orphaned function_call with no preceding assistant message — create one
+            tool_call = {
+                "id": item["call_id"],
+                "type": "function",
+                "function": {"name": item["name"], "arguments": item["arguments"]},
+            }
+            if messages and messages[-1].get("role") == "assistant":
+                # Attach to the last assistant message
+                if "tool_calls" not in messages[-1]:
+                    messages[-1]["tool_calls"] = []
+                    # If the assistant message had text content, keep it; otherwise null
+                messages[-1]["tool_calls"].append(tool_call)
+            else:
+                messages.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
+            i += 1
+            continue
+
+        if item.get("_type") == "function_call_output":
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item["call_id"],
+                "content": item["content"],
+            })
+            i += 1
+            continue
+
+        # Regular message: check if followed immediately by function_call(s)
+        msg = dict(item)
+        # Look ahead: collect any consecutive function_calls that follow
+        j = i + 1
+        tool_calls = []
+        while j < len(intermediate) and intermediate[j].get("_type") == "function_call":
+            fc = intermediate[j]
+            tool_calls.append({
+                "id": fc["call_id"],
+                "type": "function",
+                "function": {"name": fc["name"], "arguments": fc["arguments"]},
+            })
+            j += 1
+
+        if tool_calls and msg.get("role") == "assistant":
+            msg["tool_calls"] = tool_calls
+            # Flatten text content to string if it's a list with only text parts
+            c = msg.get("content")
+            if isinstance(c, list):
+                texts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                if texts:
+                    msg["content"] = "\n".join(texts)
+                else:
+                    msg["content"] = None
+            messages.append(msg)
+            i = j  # skip the consumed function_call items
+        else:
+            messages.append(msg)
+            i += 1
+
+    return messages
+
+
+def _convert_responses_tools_to_chat_tools(tools: list) -> list:
+    """
+    Convert Responses API tool format to Chat Completions tool format.
+
+    Responses API: {"type": "function", "name": "...", "parameters": {...}, "description": "..."}
+    Chat Completions: {"type": "function", "function": {"name": "...", "parameters": {...}, "description": "..."}}
+    """
+    converted = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            converted.append(tool)
+            continue
+        # Already in Chat Completions format
+        if "function" in tool:
+            converted.append(tool)
+            continue
+        # Responses API flat format -> nested Chat Completions format
+        if tool.get("type") == "function" and "name" in tool:
+            func_def = {}
+            if "name" in tool:
+                func_def["name"] = tool["name"]
+            if "description" in tool:
+                func_def["description"] = tool["description"]
+            if "parameters" in tool:
+                func_def["parameters"] = tool["parameters"]
+            elif "schema" in tool:
+                func_def["parameters"] = tool["schema"]
+            if "strict" in tool:
+                func_def["strict"] = tool["strict"]
+            converted.append({"type": "function", "function": func_def})
+        else:
+            converted.append(tool)
+    return converted
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(user_api_key_auth)],
@@ -8487,6 +8676,40 @@ async def chat_completion(  # noqa: PLR0915
     global general_settings, user_debug, proxy_logging_obj, llm_model_list
     global user_temperature, user_request_timeout, user_max_tokens, user_api_base
     data = await _read_request_body(request=request)
+
+    # Convert Responses API format (input) to Chat Completions format (messages)
+    # when Cursor sends requests with "input" instead of "messages"
+    if isinstance(data, dict) and "messages" not in data and "input" in data:
+        _input = data.pop("input")
+        # #region agent log
+        try:
+            import json as _json, time as _time
+            _items = _input if isinstance(_input, list) else []
+            _item_types = [i.get("type") if isinstance(i, dict) else str(type(i)) for i in _items]
+            _log_entry = _json.dumps({"sessionId":"6957df","hypothesisId":"H1-H5","location":"proxy_server.py:input_conversion","message":"raw input array before conversion","data":{"input_type":str(type(_input)),"input_len":len(_items),"item_types":_item_types},"timestamp":int(_time.time()*1000)})
+            with open("/Users/jeffallo/Documents/main_projects/trace/.cursor/debug-6957df.log","a") as _f: _f.write(_log_entry+"\n")
+        except Exception: pass
+        # #endregion
+        if isinstance(_input, str):
+            data["messages"] = [{"role": "user", "content": _input}]
+        elif isinstance(_input, list):
+            data["messages"] = _convert_responses_input_to_messages(_input)
+        # Remove Responses-API-only fields that are invalid for chat completions
+        data.pop("store", None)
+        # Convert Responses API tool format to Chat Completions tool format
+        if "tools" in data and isinstance(data["tools"], list):
+            data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
+        # #region agent log
+        try:
+            import json as _json, time as _time
+            _msgs = data.get("messages", [])
+            _roles = [m.get("role") if isinstance(m, dict) else "?" for m in _msgs]
+            _has_tool_calls = [bool(m.get("tool_calls")) if isinstance(m, dict) else False for m in _msgs]
+            _log_entry = _json.dumps({"sessionId":"6957df","runId":"post-fix","hypothesisId":"H1-H5","location":"proxy_server.py:post_conversion","message":"messages after conversion","data":{"msg_count":len(_msgs),"roles":_roles,"has_tool_calls":_has_tool_calls},"timestamp":int(_time.time()*1000)})
+            with open("/Users/jeffallo/Documents/main_projects/trace/.cursor/debug-6957df.log","a") as _f: _f.write(_log_entry+"\n")
+        except Exception: pass
+        # #endregion
+
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
             # Covers both missing and JSON-string metadata (multipart /
