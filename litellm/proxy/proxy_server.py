@@ -8706,54 +8706,10 @@ async def chat_completion(  # noqa: PLR0915
     global user_temperature, user_request_timeout, user_max_tokens, user_api_base
     data = await _read_request_body(request=request)
 
-    if isinstance(data, dict):
-        import json as _json
-
-        def _truncate(v: object, max_len: int = 300) -> object:
-            if isinstance(v, str):
-                return v[:max_len] + ("…" if len(v) > max_len else "")
-            if isinstance(v, list):
-                return [_truncate(i, max_len) for i in v[:5]] + (
-                    [f"… +{len(v)-5} more"] if len(v) > 5 else []
-                )
-            if isinstance(v, dict):
-                return {k: _truncate(val, max_len) for k, val in v.items()}
-            return v
-
-        _loggable = {
-            k: _truncate(v)
-            for k, v in data.items()
-            if k not in ("messages",)  # messages can be huge; logged separately below
-        }
-        verbose_proxy_logger.warning(
-            "cursor_compat: full raw request (messages excluded) =\n%s",
-            _json.dumps(_loggable, indent=2, default=str),
-        )
-        if "messages" in data:
-            _msg_summary = [
-                {
-                    "role": m.get("role"),
-                    "content_type": type(m.get("content")).__name__,
-                    "content_preview": _truncate(m.get("content"), 200),
-                    "tool_calls": bool(m.get("tool_calls")),
-                }
-                for m in data["messages"]
-            ]
-            verbose_proxy_logger.warning(
-                "cursor_compat: messages summary =\n%s",
-                _json.dumps(_msg_summary, indent=2, default=str),
-            )
-
     # Convert Responses API format (input) to Chat Completions format (messages)
     # when Cursor sends requests with "input" instead of "messages"
     if isinstance(data, dict) and "messages" not in data and "input" in data:
         _input = data.pop("input")
-        _items = _input if isinstance(_input, list) else []
-        verbose_proxy_logger.info(
-            "cursor_compat: converting input→messages — input_type=%s item_count=%d item_types=%s",
-            type(_input).__name__, len(_items),
-            [i.get("type") if isinstance(i, dict) else type(i).__name__ for i in _items],
-        )
         if isinstance(_input, str):
             data["messages"] = [{"role": "user", "content": _input}]
         elif isinstance(_input, list):
@@ -8812,27 +8768,12 @@ async def chat_completion(  # noqa: PLR0915
             "prompt_cache_retention",   # OpenAI cache-retention hint — Anthropic caching is per content block
         ):
             data.pop(_field, None)
-        _msgs = data.get("messages", [])
-        verbose_proxy_logger.info(
-            "cursor_compat: post-conversion — msg_count=%d roles=%s has_tool_calls=%s",
-            len(_msgs),
-            [m.get("role") if isinstance(m, dict) else "?" for m in _msgs],
-            [bool(m.get("tool_calls")) if isinstance(m, dict) else False for m in _msgs],
-        )
 
     # Convert Responses API flat tool format to Chat Completions nested format.
     # Must run for ALL requests (not just Responses API ones), because Cursor
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
-        verbose_proxy_logger.warning(
-            "cursor_compat: converting tools — before=%s",
-            [str(t)[:200] for t in data["tools"][:3]],
-        )
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
-        verbose_proxy_logger.warning(
-            "cursor_compat: tools after conversion — after=%s",
-            [str(t)[:200] for t in data["tools"][:3]],
-        )
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
