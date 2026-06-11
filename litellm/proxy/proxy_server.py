@@ -8775,6 +8775,24 @@ async def chat_completion(  # noqa: PLR0915
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
 
+    # Log when the conversation ends with an assistant message (potential prefill).
+    # Some Anthropic models reject this — log it so we can decide how to handle it.
+    if isinstance(data, dict) and "messages" in data and isinstance(data["messages"], list):
+        _messages = data["messages"]
+        if (
+            _messages
+            and isinstance(_messages[-1], dict)
+            and _messages[-1].get("role") == "assistant"
+        ):
+            _last = _messages[-1]
+            verbose_proxy_logger.warning(
+                "cursor_compat: conversation ends with assistant message — "
+                "content=%r, has_tool_calls=%s, total_messages=%d",
+                _last.get("content")[:500] if isinstance(_last.get("content"), str) else _last.get("content"),
+                bool(_last.get("tool_calls")),
+                len(_messages),
+            )
+
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
             # Covers both missing and JSON-string metadata (multipart /
