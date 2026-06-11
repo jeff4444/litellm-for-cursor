@@ -8779,19 +8779,25 @@ async def chat_completion(  # noqa: PLR0915
     # Some Anthropic models reject this — log it so we can decide how to handle it.
     if isinstance(data, dict) and "messages" in data and isinstance(data["messages"], list):
         _messages = data["messages"]
-        if (
-            _messages
-            and isinstance(_messages[-1], dict)
-            and _messages[-1].get("role") == "assistant"
-        ):
+        _last_role = _messages[-1].get("role") if _messages and isinstance(_messages[-1], dict) else "N/A"
+        verbose_proxy_logger.warning(
+            "cursor_compat: messages check — count=%d, last_role=%s, last_keys=%s",
+            len(_messages),
+            _last_role,
+            list(_messages[-1].keys()) if _messages and isinstance(_messages[-1], dict) else "N/A",
+        )
+        if _last_role == "assistant":
             _last = _messages[-1]
             verbose_proxy_logger.warning(
-                "cursor_compat: conversation ends with assistant message — "
-                "content=%r, has_tool_calls=%s, total_messages=%d",
+                "cursor_compat: TRAILING ASSISTANT — content=%r, has_tool_calls=%s",
                 _last.get("content")[:500] if isinstance(_last.get("content"), str) else _last.get("content"),
                 bool(_last.get("tool_calls")),
-                len(_messages),
             )
+    elif isinstance(data, dict):
+        verbose_proxy_logger.warning(
+            "cursor_compat: NO messages key in data — keys=%s",
+            list(data.keys()),
+        )
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
