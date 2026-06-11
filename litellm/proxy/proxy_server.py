@@ -8703,14 +8703,42 @@ async def chat_completion(  # noqa: PLR0915
     data = await _read_request_body(request=request)
 
     if isinstance(data, dict):
-        _has_input = "input" in data
-        _has_messages = "messages" in data
-        _has_tools = "tools" in data
-        _tools_sample = [str(t)[:300] for t in (data.get("tools") or [])[:3]]
+        import json as _json
+
+        def _truncate(v: object, max_len: int = 300) -> object:
+            if isinstance(v, str):
+                return v[:max_len] + ("…" if len(v) > max_len else "")
+            if isinstance(v, list):
+                return [_truncate(i, max_len) for i in v[:5]] + (
+                    [f"… +{len(v)-5} more"] if len(v) > 5 else []
+                )
+            if isinstance(v, dict):
+                return {k: _truncate(val, max_len) for k, val in v.items()}
+            return v
+
+        _loggable = {
+            k: _truncate(v)
+            for k, v in data.items()
+            if k not in ("messages",)  # messages can be huge; logged separately below
+        }
         verbose_proxy_logger.warning(
-            "cursor_compat: raw request — model=%s has_input=%s has_messages=%s has_tools=%s tools_sample=%s",
-            data.get("model"), _has_input, _has_messages, _has_tools, _tools_sample,
+            "cursor_compat: full raw request (messages excluded) =\n%s",
+            _json.dumps(_loggable, indent=2, default=str),
         )
+        if "messages" in data:
+            _msg_summary = [
+                {
+                    "role": m.get("role"),
+                    "content_type": type(m.get("content")).__name__,
+                    "content_preview": _truncate(m.get("content"), 200),
+                    "tool_calls": bool(m.get("tool_calls")),
+                }
+                for m in data["messages"]
+            ]
+            verbose_proxy_logger.warning(
+                "cursor_compat: messages summary =\n%s",
+                _json.dumps(_msg_summary, indent=2, default=str),
+            )
 
     # Convert Responses API format (input) to Chat Completions format (messages)
     # when Cursor sends requests with "input" instead of "messages"
@@ -8749,6 +8777,26 @@ async def chat_completion(  # noqa: PLR0915
             )
             if _wants_reasoning and "reasoning_effort" not in data:
                 data["reasoning_effort"] = "medium"
+
+        # `text` → `response_format`
+        # Responses API: {"format": {"type": "json_object"}} or {"format": {"type": "json_schema", "schema": {...}, "name": "..."}}
+        # Chat Completions: {"type": "json_object"} or {"type": "json_schema", "json_schema": {"name": ..., "schema": ...}}
+        _text = data.pop("text", None)
+        if isinstance(_text, dict):
+            _fmt = _text.get("format", {})
+            _fmt_type = _fmt.get("type") if isinstance(_fmt, dict) else None
+            if _fmt_type == "json_object":
+                data.setdefault("response_format", {"type": "json_object"})
+            elif _fmt_type == "json_schema":
+                data.setdefault("response_format", {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": _fmt.get("name", "response"),
+                        "schema": _fmt.get("schema", {}),
+                        "strict": _fmt.get("strict", True),
+                    },
+                })
+            # type == "text" is the default; nothing to set
 
         # Drop remaining Responses-API-only fields that have no Anthropic equivalent.
         for _field in (
