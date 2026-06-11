@@ -8677,50 +8677,53 @@ async def chat_completion(  # noqa: PLR0915
     global user_temperature, user_request_timeout, user_max_tokens, user_api_base
     data = await _read_request_body(request=request)
 
-    # #region agent log
-    try:
-        import json as _json, time as _time
-        _tools_sample = [str(t)[:200] for t in (data.get("tools") or [])[:3]] if isinstance(data, dict) else []
-        _log_entry = _json.dumps({"sessionId":"6957df","hypothesisId":"TOOLS","location":"proxy_server.py:8678","message":"raw request data","data":{"has_input":"input" in data if isinstance(data, dict) else False,"has_messages":"messages" in data if isinstance(data, dict) else False,"has_tools":"tools" in data if isinstance(data, dict) else False,"model":data.get("model") if isinstance(data, dict) else None,"tools_sample":_tools_sample},"timestamp":int(_time.time()*1000)})
-        with open("/tmp/debug-6957df.log","a") as _f: _f.write(_log_entry+"\n")
-    except Exception: pass
-    # #endregion
+    if isinstance(data, dict):
+        _has_input = "input" in data
+        _has_messages = "messages" in data
+        _has_tools = "tools" in data
+        _tools_sample = [str(t)[:300] for t in (data.get("tools") or [])[:3]]
+        verbose_proxy_logger.info(
+            "cursor_compat: raw request — model=%s has_input=%s has_messages=%s has_tools=%s tools_sample=%s",
+            data.get("model"), _has_input, _has_messages, _has_tools, _tools_sample,
+        )
 
     # Convert Responses API format (input) to Chat Completions format (messages)
     # when Cursor sends requests with "input" instead of "messages"
     if isinstance(data, dict) and "messages" not in data and "input" in data:
         _input = data.pop("input")
-        # #region agent log
-        try:
-            import json as _json, time as _time
-            _items = _input if isinstance(_input, list) else []
-            _item_types = [i.get("type") if isinstance(i, dict) else str(type(i)) for i in _items]
-            _log_entry = _json.dumps({"sessionId":"6957df","hypothesisId":"H1-H5","location":"proxy_server.py:input_conversion","message":"raw input array before conversion","data":{"input_type":str(type(_input)),"input_len":len(_items),"item_types":_item_types},"timestamp":int(_time.time()*1000)})
-            with open("/Users/jeffallo/Documents/main_projects/trace/.cursor/debug-6957df.log","a") as _f: _f.write(_log_entry+"\n")
-        except Exception: pass
-        # #endregion
+        _items = _input if isinstance(_input, list) else []
+        verbose_proxy_logger.info(
+            "cursor_compat: converting input→messages — input_type=%s item_count=%d item_types=%s",
+            type(_input).__name__, len(_items),
+            [i.get("type") if isinstance(i, dict) else type(i).__name__ for i in _items],
+        )
         if isinstance(_input, str):
             data["messages"] = [{"role": "user", "content": _input}]
         elif isinstance(_input, list):
             data["messages"] = _convert_responses_input_to_messages(_input)
         # Remove Responses-API-only fields that are invalid for chat completions
         data.pop("store", None)
-        # #region agent log
-        try:
-            import json as _json, time as _time
-            _msgs = data.get("messages", [])
-            _roles = [m.get("role") if isinstance(m, dict) else "?" for m in _msgs]
-            _has_tool_calls = [bool(m.get("tool_calls")) if isinstance(m, dict) else False for m in _msgs]
-            _log_entry = _json.dumps({"sessionId":"6957df","runId":"post-fix","hypothesisId":"H1-H5","location":"proxy_server.py:post_conversion","message":"messages after conversion","data":{"msg_count":len(_msgs),"roles":_roles,"has_tool_calls":_has_tool_calls},"timestamp":int(_time.time()*1000)})
-            with open("/tmp/debug-6957df.log","a") as _f: _f.write(_log_entry+"\n")
-        except Exception: pass
-        # #endregion
+        _msgs = data.get("messages", [])
+        verbose_proxy_logger.info(
+            "cursor_compat: post-conversion — msg_count=%d roles=%s has_tool_calls=%s",
+            len(_msgs),
+            [m.get("role") if isinstance(m, dict) else "?" for m in _msgs],
+            [bool(m.get("tool_calls")) if isinstance(m, dict) else False for m in _msgs],
+        )
 
     # Convert Responses API flat tool format to Chat Completions nested format.
     # Must run for ALL requests (not just Responses API ones), because Cursor
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
+        verbose_proxy_logger.info(
+            "cursor_compat: converting tools — before=%s",
+            [str(t)[:200] for t in data["tools"][:3]],
+        )
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
+        verbose_proxy_logger.info(
+            "cursor_compat: tools after conversion — after=%s",
+            [str(t)[:200] for t in data["tools"][:3]],
+        )
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
