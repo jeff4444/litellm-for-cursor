@@ -8505,15 +8505,19 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
                 if part_type == "input_text":
                     converted_content.append({"type": "text", "text": part.get("text", "")})
                 elif part_type == "output_text":
-                    # Assistant response text
+                    # Assistant response text — strip annotations and other
+                    # Responses-API-only keys that Anthropic does not accept.
                     converted_content.append({"type": "text", "text": part.get("text", "")})
                 elif part_type == "input_image":
-                    img_data = {}
-                    for key in ("image_url", "url", "file_id"):
-                        if key in part:
-                            img_data["url"] = part[key]
-                            break
-                    converted_content.append({"type": "image_url", "image_url": img_data})
+                    # Responses API image — extract the URL/file_id and build
+                    # a clean image_url content part, dropping unknown keys.
+                    img_url: str = (
+                        part.get("image_url")
+                        or part.get("url")
+                        or part.get("file_id")
+                        or ""
+                    )
+                    converted_content.append({"type": "image_url", "image_url": {"url": img_url}})
                 else:
                     converted_content.append(part)
             intermediate.append({"role": role or "user", "content": converted_content})
@@ -8800,11 +8804,12 @@ async def chat_completion(  # noqa: PLR0915
 
         # Drop remaining Responses-API-only fields that have no Anthropic equivalent.
         for _field in (
-            "store",               # Persistence flag — no Anthropic equivalent
-            "truncation",          # Truncation strategy — Anthropic manages context windows internally
-            "previous_response_id",  # Conversation threading via ID — our proxy uses messages[]
-            "background",          # Background-mode flag — no Anthropic equivalent
-            "output",              # Output-format wrapper — handled separately via response_format
+            "store",                    # Persistence flag
+            "truncation",               # Truncation strategy — Anthropic manages context windows internally
+            "previous_response_id",     # Conversation threading via ID — history is carried in messages[]
+            "background",               # Background-mode flag
+            "output",                   # Output-format wrapper — handled separately via response_format
+            "prompt_cache_retention",   # OpenAI cache-retention hint — Anthropic caching is per content block
         ):
             data.pop(_field, None)
         _msgs = data.get("messages", [])
