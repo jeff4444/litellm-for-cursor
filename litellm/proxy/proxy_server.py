@@ -8726,8 +8726,39 @@ async def chat_completion(  # noqa: PLR0915
             data["messages"] = [{"role": "user", "content": _input}]
         elif isinstance(_input, list):
             data["messages"] = _convert_responses_input_to_messages(_input)
-        # Remove Responses-API-only fields that are invalid for chat completions
-        data.pop("store", None)
+
+        # Translate Responses API fields to their Chat Completions equivalents,
+        # or drop them when there is no meaningful Anthropic equivalent.
+
+        # `reasoning` → `reasoning_effort`
+        # OpenAI Responses API: {"effort": "high"} or {"effort": "medium", "summary": "auto"}
+        # LiteLLM already maps `reasoning_effort` → Anthropic `thinking` param.
+        _reasoning = data.pop("reasoning", None)
+        if isinstance(_reasoning, dict) and "effort" in _reasoning:
+            data.setdefault("reasoning_effort", _reasoning["effort"])
+        elif isinstance(_reasoning, str):
+            data.setdefault("reasoning_effort", _reasoning)
+
+        # `include` → enable reasoning_effort if reasoning content is requested
+        # e.g. include=["reasoning.encrypted_content", "reasoning.content"]
+        _include = data.pop("include", None)
+        if isinstance(_include, list):
+            _wants_reasoning = any(
+                isinstance(item, str) and item.startswith("reasoning")
+                for item in _include
+            )
+            if _wants_reasoning and "reasoning_effort" not in data:
+                data["reasoning_effort"] = "medium"
+
+        # Drop remaining Responses-API-only fields that have no Anthropic equivalent.
+        for _field in (
+            "store",               # Persistence flag — no Anthropic equivalent
+            "truncation",          # Truncation strategy — Anthropic manages context windows internally
+            "previous_response_id",  # Conversation threading via ID — our proxy uses messages[]
+            "background",          # Background-mode flag — no Anthropic equivalent
+            "output",              # Output-format wrapper — handled separately via response_format
+        ):
+            data.pop(_field, None)
         _msgs = data.get("messages", [])
         verbose_proxy_logger.info(
             "cursor_compat: post-conversion — msg_count=%d roles=%s has_tool_calls=%s",
