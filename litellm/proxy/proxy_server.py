@@ -8590,36 +8590,61 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
 
 def _convert_responses_tools_to_chat_tools(tools: list) -> list:
     """
-    Convert Responses API tool format to Chat Completions tool format.
+    Convert Responses API flat tool format to Chat Completions nested format.
 
     Responses API: {"type": "function", "name": "...", "parameters": {...}, "description": "..."}
     Chat Completions: {"type": "function", "function": {"name": "...", "parameters": {...}, "description": "..."}}
+
+    Anthropic's mapper requires a "function" key for tools with type "function" or "custom".
+    We wrap any such tool that is missing that key, regardless of whether "name" is present.
     """
+    # Tool types that Anthropic handles without needing a "function" wrapper.
+    # These are passed through as-is.
+    _ANTHROPIC_HOSTED = {
+        "web_search", "bash", "text_editor", "code_execution",
+        "web_fetch", "memory", "tool_search_tool",
+    }
+    _PASS_THROUGH_PREFIXES = ("computer_",)
+    _PASS_THROUGH_EXACT = {"url", "mcp", "tool_search_tool_regex_20251119", "tool_search_tool_bm25_20251119"}
+
     converted = []
     for tool in tools:
         if not isinstance(tool, dict):
             converted.append(tool)
             continue
-        # Already in Chat Completions format
+
+        # Already in Chat Completions nested format — nothing to do.
         if "function" in tool:
             converted.append(tool)
             continue
-        # Responses API flat format -> nested Chat Completions format
-        if tool.get("type") == "function" and "name" in tool:
-            func_def = {}
-            if "name" in tool:
-                func_def["name"] = tool["name"]
-            if "description" in tool:
-                func_def["description"] = tool["description"]
+
+        tool_type = tool.get("type", "")
+
+        # Hosted / special tool types that don't use a "function" wrapper.
+        if (
+            tool_type in _PASS_THROUGH_EXACT
+            or any(tool_type.startswith(p) for p in _PASS_THROUGH_PREFIXES)
+            or any(tool_type.startswith(h) for h in _ANTHROPIC_HOSTED)
+        ):
+            converted.append(tool)
+            continue
+
+        # Any remaining tool with type "function" or "custom" (and anything
+        # else unrecognised) needs wrapping — even if "name" is absent.
+        if tool_type in ("function", "custom") or tool_type == "":
+            func_def: dict = {}
+            for key in ("name", "description", "strict"):
+                if key in tool:
+                    func_def[key] = tool[key]
             if "parameters" in tool:
                 func_def["parameters"] = tool["parameters"]
             elif "schema" in tool:
                 func_def["parameters"] = tool["schema"]
-            if "strict" in tool:
-                func_def["strict"] = tool["strict"]
             converted.append({"type": "function", "function": func_def})
         else:
+            # Unknown type — pass through and let LiteLLM / Anthropic handle it.
             converted.append(tool)
+
     return converted
 
 
@@ -8682,7 +8707,7 @@ async def chat_completion(  # noqa: PLR0915
         _has_messages = "messages" in data
         _has_tools = "tools" in data
         _tools_sample = [str(t)[:300] for t in (data.get("tools") or [])[:3]]
-        verbose_proxy_logger.info(
+        verbose_proxy_logger.warning(
             "cursor_compat: raw request — model=%s has_input=%s has_messages=%s has_tools=%s tools_sample=%s",
             data.get("model"), _has_input, _has_messages, _has_tools, _tools_sample,
         )
@@ -8715,12 +8740,12 @@ async def chat_completion(  # noqa: PLR0915
     # Must run for ALL requests (not just Responses API ones), because Cursor
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
-        verbose_proxy_logger.info(
+        verbose_proxy_logger.warning(
             "cursor_compat: converting tools — before=%s",
             [str(t)[:200] for t in data["tools"][:3]],
         )
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
-        verbose_proxy_logger.info(
+        verbose_proxy_logger.warning(
             "cursor_compat: tools after conversion — after=%s",
             [str(t)[:200] for t in data["tools"][:3]],
         )
