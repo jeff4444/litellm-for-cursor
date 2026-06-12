@@ -7254,6 +7254,16 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
                     if idx is None:
                         idx = 0
 
+                    # #region agent log
+                    _dbg_args = _attr(fn, "arguments") if fn is not None else None
+                    verbose_proxy_logger.warning(
+                        "DBG[H6]: ps-unwrap tc chunk — name=%r idx=%r args_len=%s args_head=%r in_pending=%s",
+                        name, idx, len(_dbg_args) if isinstance(_dbg_args, str) else None,
+                        _dbg_args[:60] if isinstance(_dbg_args, str) else _dbg_args,
+                        idx in pending,
+                    )
+                    # #endregion
+
                     is_freeform = False
                     if name in freeform_tool_names:
                         is_freeform = True
@@ -7287,6 +7297,14 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
 
             # When the tool-call turn finishes, flush unwrapped arguments for any
             # pending freeform tool calls before the finish chunk goes out.
+            # #region agent log
+            if finish_reason is not None:
+                verbose_proxy_logger.warning(
+                    "DBG[H6]: ps-unwrap finish_reason=%r pending=%s buf_lens=%s",
+                    finish_reason, list(pending.keys()),
+                    {k: len(v.get("buf", "")) for k, v in pending.items()},
+                )
+            # #endregion
             if finish_reason == "tool_calls" and pending:
                 for idx, info in sorted(pending.items()):
                     if info.get("emitted"):
@@ -7296,6 +7314,14 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
                         # Could not parse as {"input": ...}; fall back to raw buf.
                         unwrapped = info["buf"]
                     info["emitted"] = True
+                    # #region agent log
+                    verbose_proxy_logger.warning(
+                        "DBG[H6]: ps-unwrap flush — idx=%s buf_len=%s unwrap_ok=%s out_len=%s out_head=%r",
+                        idx, len(info["buf"]),
+                        _unwrap_freeform_tool_arguments(info["buf"]) is not None,
+                        len(unwrapped), unwrapped[:80],
+                    )
+                    # #endregion
                     yield _build_flush_chunk(
                         chunk, _attr(choice, "index"), idx, info, unwrapped
                     )
@@ -7320,6 +7346,12 @@ def select_data_generator(
     response, user_api_key_dict: UserAPIKeyAuth, request_data: dict
 ):
     freeform_tool_names = _get_cursor_freeform_tools(request_data)
+    # #region agent log
+    verbose_proxy_logger.warning(
+        "DBG[H6/H7]: select_data_generator entry — freeform=%s",
+        sorted(freeform_tool_names),
+    )
+    # #endregion
     if freeform_tool_names:
         response = _unwrap_freeform_streaming_chunks(response, freeform_tool_names)
     return async_data_generator(
