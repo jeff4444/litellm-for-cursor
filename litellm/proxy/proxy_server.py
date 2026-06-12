@@ -8779,6 +8779,22 @@ async def chat_completion(  # noqa: PLR0915
     # Must run for ALL requests (not just Responses API ones), because Cursor
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
+        # TEMP DIAGNOSTIC: dump the raw definition of any freeform/custom tool
+        # (e.g. Cursor's ApplyPatch) exactly as Cursor sends it, so we can see
+        # the expected input contract before transforming it. Remove after debug.
+        try:
+            import json as _json_dbg
+            for _t in data["tools"]:
+                if not isinstance(_t, dict):
+                    continue
+                _tname = _t.get("name") or (_t.get("function") or {}).get("name")
+                if _t.get("type") == "custom" or _tname == "ApplyPatch":
+                    verbose_proxy_logger.warning(
+                        "cursor_compat: raw custom tool definition: %s",
+                        _json_dbg.dumps(_t),
+                    )
+        except Exception:
+            pass
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
 
     if user_api_key_dict is not None:
