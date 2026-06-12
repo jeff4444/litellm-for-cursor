@@ -677,6 +677,15 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
                     idx = _attr(tc, "index")
                     if idx is None:
                         idx = 0
+                    # #region agent log
+                    _dbg_args = _attr(fn, "arguments") if fn is not None else None
+                    verbose_proxy_logger.warning(
+                        "DBG[H3/H5]: tc chunk — name=%r idx=%r args_len=%s args_head=%r in_pending=%s",
+                        name, idx, len(_dbg_args) if isinstance(_dbg_args, str) else None,
+                        _dbg_args[:60] if isinstance(_dbg_args, str) else _dbg_args,
+                        idx in pending,
+                    )
+                    # #endregion
 
                     is_freeform = False
                     if name in freeform_tool_names:
@@ -707,6 +716,14 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
                 if delta is not None:
                     _set_attr(delta, "tool_calls", kept if kept else None)
 
+            # #region agent log
+            if finish_reason is not None:
+                verbose_proxy_logger.warning(
+                    "DBG[H3]: finish_reason=%r pending_keys=%s buf_lens=%s",
+                    finish_reason, list(pending.keys()),
+                    {k: len(v.get("buf", "")) for k, v in pending.items()},
+                )
+            # #endregion
             if finish_reason == "tool_calls" and pending:
                 for idx, info in sorted(pending.items()):
                     if info.get("emitted"):
@@ -715,6 +732,14 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
                     if unwrapped is None:
                         unwrapped = info["buf"]
                     info["emitted"] = True
+                    # #region agent log
+                    verbose_proxy_logger.warning(
+                        "DBG[H3/H5]: flush — idx=%s buf_len=%s unwrap_ok=%s out_len=%s out_head=%r",
+                        idx, len(info["buf"]),
+                        _unwrap_freeform_tool_arguments_str(info["buf"]) is not None,
+                        len(unwrapped), unwrapped[:80],
+                    )
+                    # #endregion
                     yield _build_flush_chunk(
                         chunk, _attr(choice, "index"), idx, info, unwrapped
                     )
@@ -729,6 +754,12 @@ async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names
         if unwrapped is None:
             unwrapped = info["buf"]
         info["emitted"] = True
+        # #region agent log
+        verbose_proxy_logger.warning(
+            "DBG[H3]: end-of-stream flush — idx=%s buf_len=%s out_len=%s",
+            idx, len(info["buf"]), len(unwrapped),
+        )
+        # #endregion
         yield _build_flush_chunk(last_chunk, 0, idx, info, unwrapped)
 
 
@@ -2193,6 +2224,15 @@ class ProxyBaseLLMRequestProcessing:
         # /chat/completions, so it must be applied here (select_data_generator is
         # bypassed for already-streaming responses).
         _freeform_tool_names = _get_cursor_freeform_tools(request_data)
+        # #region agent log
+        _meta_dbg = request_data.get("litellm_metadata") if isinstance(request_data, dict) else None
+        verbose_proxy_logger.warning(
+            "DBG[H1/H2]: async_streaming_data_generator entry — freeform=%s, litellm_metadata_keys=%s, has_tools=%s",
+            sorted(_freeform_tool_names),
+            list(_meta_dbg.keys()) if isinstance(_meta_dbg, dict) else type(_meta_dbg).__name__,
+            bool(request_data.get("tools")) if isinstance(request_data, dict) else "n/a",
+        )
+        # #endregion
         if _freeform_tool_names:
             verbose_proxy_logger.warning(
                 "cursor_compat: unwrapping freeform tool stream for tools=%s",

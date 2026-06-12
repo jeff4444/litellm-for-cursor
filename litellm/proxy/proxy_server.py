@@ -7032,6 +7032,13 @@ async def async_data_generator(  # noqa: PLR0915
     response, user_api_key_dict: UserAPIKeyAuth, request_data: dict
 ):
     verbose_proxy_logger.debug("inside generator")
+    # #region agent log
+    _meta_dbg = request_data.get("litellm_metadata") if isinstance(request_data, dict) else None
+    verbose_proxy_logger.warning(
+        "DBG[H2]: async_data_generator (proxy_server) entry — litellm_metadata_keys=%s",
+        list(_meta_dbg.keys()) if isinstance(_meta_dbg, dict) else type(_meta_dbg).__name__,
+    )
+    # #endregion
     try:
         error_message: Optional[str] = None
         requested_model_from_client = _get_client_requested_model_for_streaming(
@@ -9114,6 +9121,13 @@ async def chat_completion(  # noqa: PLR0915
             data["litellm_metadata"]["cursor_freeform_tools"] = sorted(
                 _freeform_tool_names
             )
+        # #region agent log
+        verbose_proxy_logger.warning(
+            "DBG[H1/H4]: tool conversion done — freeform=%s, litellm_metadata_keys=%s",
+            sorted(_freeform_tool_names),
+            list(data.get("litellm_metadata", {}).keys()) if isinstance(data.get("litellm_metadata"), dict) else type(data.get("litellm_metadata")).__name__,
+        )
+        # #endregion
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
