@@ -556,6 +556,182 @@ def _has_attribute_error_in_chain(exc: Exception) -> bool:
     return False
 
 
+# Property name used to wrap a freeform/grammar custom tool's raw text input
+# into a single-field JSON schema. Kept in sync with proxy_server.py.
+_FREEFORM_TOOL_ARG_KEY = "input"
+
+
+def _get_cursor_freeform_tools(request_data: Any) -> set:
+    """Read the set of freeform tool names recorded for this request, if any.
+
+    Set on the request by proxy_server.py when Cursor sends a freeform/grammar
+    custom tool (e.g. ApplyPatch). Stored under litellm_metadata as a list.
+    """
+    if not isinstance(request_data, dict):
+        return set()
+    meta = request_data.get("litellm_metadata")
+    if isinstance(meta, dict):
+        names = meta.get("cursor_freeform_tools")
+        if names:
+            return set(names)
+    return set()
+
+
+def _unwrap_freeform_tool_arguments_str(arguments: str) -> Optional[str]:
+    """Unwrap ``{"input": "<raw text>"}`` JSON arguments back to raw text.
+
+    Returns ``None`` if the string is not a complete JSON object with the
+    expected key (e.g. partial streaming fragments), so callers leave it as-is.
+    """
+    if not isinstance(arguments, str) or not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(parsed, dict) and _FREEFORM_TOOL_ARG_KEY in parsed:
+        value = parsed[_FREEFORM_TOOL_ARG_KEY]
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+    return None
+
+
+async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names: set):
+    """Rewrite freeform/grammar tool-call arguments in a streaming response.
+
+    Cursor's ApplyPatch is a freeform grammar tool whose tool-call input must be
+    raw text, but we present it to the model as a JSON tool with a single
+    ``input`` string property, so the model emits ``{"input": "<raw text>"}``.
+    Tool-call arguments stream as JSON fragments, so we buffer them per tool-call
+    index, suppress the partial JSON pass-through, and emit a single delta with
+    the unwrapped raw text once the tool call completes. Everything else passes
+    through untouched.
+    """
+    pending: dict = {}
+    last_chunk = None
+
+    def _attr(obj, key):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _set_attr(obj, key, value):
+        if isinstance(obj, dict):
+            obj[key] = value
+        else:
+            setattr(obj, key, value)
+
+    def _get_choices(chunk):
+        if isinstance(chunk, ModelResponseStream) or hasattr(chunk, "choices"):
+            return getattr(chunk, "choices", None)
+        if isinstance(chunk, dict):
+            return chunk.get("choices")
+        return None
+
+    def _build_flush_chunk(template, choice_index, idx, info, unwrapped):
+        return ModelResponseStream(
+            id=_attr(template, "id"),
+            created=_attr(template, "created"),
+            model=_attr(template, "model"),
+            choices=[
+                litellm.utils.StreamingChoices(
+                    index=choice_index or 0,
+                    delta=litellm.utils.Delta(
+                        tool_calls=[
+                            {
+                                "index": idx,
+                                "id": info.get("id"),
+                                "type": info.get("type", "function"),
+                                "function": {
+                                    "name": None,
+                                    "arguments": unwrapped,
+                                },
+                            }
+                        ]
+                    ),
+                    finish_reason=None,
+                )
+            ],
+        )
+
+    async for chunk in stream_iterator:
+        last_chunk = chunk
+        choices = _get_choices(chunk)
+        if not choices:
+            yield chunk
+            continue
+
+        for choice in choices:
+            delta = _attr(choice, "delta")
+            tool_calls = _attr(delta, "tool_calls") if delta is not None else None
+            finish_reason = _attr(choice, "finish_reason")
+
+            if tool_calls:
+                kept = []
+                for tc in tool_calls:
+                    fn = _attr(tc, "function")
+                    name = _attr(fn, "name") if fn is not None else None
+                    idx = _attr(tc, "index")
+                    if idx is None:
+                        idx = 0
+
+                    is_freeform = False
+                    if name in freeform_tool_names:
+                        is_freeform = True
+                        pending[idx] = {
+                            "buf": "",
+                            "name": name,
+                            "id": _attr(tc, "id"),
+                            "type": _attr(tc, "type") or "function",
+                        }
+                    elif idx in pending:
+                        is_freeform = True
+
+                    if not is_freeform:
+                        kept.append(tc)
+                        continue
+
+                    args_fragment = (
+                        _attr(fn, "arguments") if fn is not None else None
+                    )
+                    if args_fragment:
+                        pending[idx]["buf"] += args_fragment
+                    if name is not None:
+                        if fn is not None:
+                            _set_attr(fn, "arguments", "")
+                        kept.append(tc)
+
+                if delta is not None:
+                    _set_attr(delta, "tool_calls", kept if kept else None)
+
+            if finish_reason == "tool_calls" and pending:
+                for idx, info in sorted(pending.items()):
+                    if info.get("emitted"):
+                        continue
+                    unwrapped = _unwrap_freeform_tool_arguments_str(info["buf"])
+                    if unwrapped is None:
+                        unwrapped = info["buf"]
+                    info["emitted"] = True
+                    yield _build_flush_chunk(
+                        chunk, _attr(choice, "index"), idx, info, unwrapped
+                    )
+                pending.clear()
+
+        yield chunk
+
+    for idx, info in sorted(pending.items()):
+        if info.get("emitted"):
+            continue
+        unwrapped = _unwrap_freeform_tool_arguments_str(info["buf"])
+        if unwrapped is None:
+            unwrapped = info["buf"]
+        info["emitted"] = True
+        yield _build_flush_chunk(last_chunk, 0, idx, info, unwrapped)
+
+
 class ProxyBaseLLMRequestProcessing:
     def __init__(self, data: dict):
         self.data = data
@@ -2011,6 +2187,20 @@ class ProxyBaseLLMRequestProcessing:
         failure hook and yields via serialize_error. Use for SSE or NDJSON.
         """
         verbose_proxy_logger.debug("inside generator")
+        # Cursor freeform/grammar tools (e.g. ApplyPatch): unwrap the model's
+        # {"input": "<raw text>"} tool-call arguments back to the raw text the
+        # client's grammar parser expects. This is the central streaming path for
+        # /chat/completions, so it must be applied here (select_data_generator is
+        # bypassed for already-streaming responses).
+        _freeform_tool_names = _get_cursor_freeform_tools(request_data)
+        if _freeform_tool_names:
+            verbose_proxy_logger.warning(
+                "cursor_compat: unwrapping freeform tool stream for tools=%s",
+                sorted(_freeform_tool_names),
+            )
+            response = _unwrap_freeform_streaming_chunks(
+                response, _freeform_tool_names
+            )
         # Resolve per-stream (not per-chunk) whether the heavy per-chunk path
         # is needed. When no callback overrides ``async_post_call_streaming_hook``,
         # no CustomGuardrail is active, and cost injection is disabled, the
