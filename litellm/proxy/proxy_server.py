@@ -8459,18 +8459,24 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
         item_type = item.get("type")
         role = item.get("role")
 
-        # Bare function_call item (no role): assistant tool invocation
-        if item_type == "function_call" and role is None:
+        # Bare function_call / custom_tool_call item (no role): assistant tool invocation
+        if item_type in ("function_call", "custom_tool_call") and role is None:
+            # custom_tool_call uses "input" (may be dict or string);
+            # function_call uses "arguments" (always string).
+            _args = item.get("arguments") or item.get("input") or "{}"
+            if not isinstance(_args, str):
+                import json as _json
+                _args = _json.dumps(_args)
             intermediate.append({
                 "_type": "function_call",
                 "call_id": item.get("call_id", ""),
                 "name": item.get("name", ""),
-                "arguments": item.get("arguments", "{}"),
+                "arguments": _args,
             })
             continue
 
-        # Bare function_call_output item (no role): tool result
-        if item_type == "function_call_output" and role is None:
+        # Bare function_call_output / custom_tool_call_output item (no role): tool result
+        if item_type in ("function_call_output", "custom_tool_call_output") and role is None:
             # output can be a string or a list of content parts
             raw_output = item.get("output", "")
             if isinstance(raw_output, list):
@@ -8523,10 +8529,6 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
             intermediate.append({"role": role or "user", "content": converted_content})
         else:
             # Fallback: pass item through
-            verbose_proxy_logger.warning(
-                "cursor_compat: input item fell through conversion — type=%r role=%r keys=%s",
-                item.get("type"), item.get("role"), list(item.keys()),
-            )
             intermediate.append(item)
 
     # Second pass: merge consecutive function_call items into the preceding
@@ -8778,30 +8780,6 @@ async def chat_completion(  # noqa: PLR0915
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
         data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
-
-    # Log when the conversation ends with an assistant message (potential prefill).
-    # Some Anthropic models reject this — log it so we can decide how to handle it.
-    if isinstance(data, dict) and "messages" in data and isinstance(data["messages"], list):
-        _messages = data["messages"]
-        _last_role = _messages[-1].get("role") if _messages and isinstance(_messages[-1], dict) else "N/A"
-        verbose_proxy_logger.warning(
-            "cursor_compat: messages check — count=%d, last_role=%s, last_keys=%s",
-            len(_messages),
-            _last_role,
-            list(_messages[-1].keys()) if _messages and isinstance(_messages[-1], dict) else "N/A",
-        )
-        if _last_role == "assistant":
-            _last = _messages[-1]
-            verbose_proxy_logger.warning(
-                "cursor_compat: TRAILING ASSISTANT — content=%r, has_tool_calls=%s",
-                _last.get("content")[:500] if isinstance(_last.get("content"), str) else _last.get("content"),
-                bool(_last.get("tool_calls")),
-            )
-    elif isinstance(data, dict):
-        verbose_proxy_logger.warning(
-            "cursor_compat: NO messages key in data — keys=%s",
-            list(data.keys()),
-        )
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
