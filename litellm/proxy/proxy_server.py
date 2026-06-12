@@ -7161,9 +7161,160 @@ async def async_data_generator(  # noqa: PLR0915
                     )
 
 
+async def _unwrap_freeform_streaming_chunks(stream_iterator, freeform_tool_names: set):
+    """
+    Async wrapper over a streaming ChatCompletion iterator that rewrites the
+    arguments of freeform/grammar tool calls (e.g. Cursor's ApplyPatch) from the
+    wrapped ``{"input": "<raw text>"}`` JSON back into the raw text Cursor's
+    grammar parser expects.
+
+    Tool-call ``arguments`` arrive as fragments across many chunks, so partial
+    JSON cannot be unwrapped per-chunk. We therefore buffer the argument
+    fragments for each freeform tool call (keyed by streaming index), suppress
+    the partial ``arguments`` from passing through, and emit the fully unwrapped
+    raw text as a single final ``arguments`` delta once the stream completes.
+    Non-freeform tool calls and all other content stream through untouched.
+    """
+    # index -> {"buf": str, "emitted": bool, "name": str, "id": str, "type": str}
+    pending: dict = {}
+    # Last chunk seen, used as a template (id/model/created) for trailing flushes.
+    last_chunk = None
+
+    def _build_flush_chunk(template, choice_index, idx, info, unwrapped):
+        return litellm.ModelResponseStream(
+            id=_attr(template, "id"),
+            created=_attr(template, "created"),
+            model=_attr(template, "model"),
+            choices=[
+                litellm.utils.StreamingChoices(
+                    index=choice_index or 0,
+                    delta=litellm.utils.Delta(
+                        tool_calls=[
+                            {
+                                "index": idx,
+                                "id": info.get("id"),
+                                "type": info.get("type", "function"),
+                                "function": {
+                                    "name": None,
+                                    "arguments": unwrapped,
+                                },
+                            }
+                        ]
+                    ),
+                    finish_reason=None,
+                )
+            ],
+        )
+
+    def _get_choices(chunk):
+        if isinstance(chunk, BaseModel):
+            return getattr(chunk, "choices", None)
+        if isinstance(chunk, dict):
+            return chunk.get("choices")
+        return None
+
+    def _attr(obj, key):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _set_attr(obj, key, value):
+        if isinstance(obj, dict):
+            obj[key] = value
+        else:
+            setattr(obj, key, value)
+
+    async for chunk in stream_iterator:
+        last_chunk = chunk
+        choices = _get_choices(chunk)
+        if not choices:
+            yield chunk
+            continue
+
+        for choice in choices:
+            delta = _attr(choice, "delta")
+            tool_calls = _attr(delta, "tool_calls") if delta is not None else None
+            finish_reason = _attr(choice, "finish_reason")
+
+            if tool_calls:
+                kept = []
+                for tc in tool_calls:
+                    fn = _attr(tc, "function")
+                    name = _attr(fn, "name") if fn is not None else None
+                    idx = _attr(tc, "index")
+                    if idx is None:
+                        idx = 0
+
+                    is_freeform = False
+                    if name in freeform_tool_names:
+                        is_freeform = True
+                        pending[idx] = {
+                            "buf": "",
+                            "name": name,
+                            "id": _attr(tc, "id"),
+                            "type": _attr(tc, "type") or "function",
+                        }
+                    elif idx in pending:
+                        is_freeform = True
+
+                    if not is_freeform:
+                        kept.append(tc)
+                        continue
+
+                    # Accumulate argument fragments; suppress partial pass-through.
+                    args_fragment = _attr(fn, "arguments") if fn is not None else None
+                    if args_fragment:
+                        pending[idx]["buf"] += args_fragment
+                    # Pass through the opening delta (name/id) once, with empty
+                    # arguments, so the client registers the tool call early.
+                    if name is not None:
+                        if fn is not None:
+                            _set_attr(fn, "arguments", "")
+                        kept.append(tc)
+
+                # Replace tool_calls with only the kept (non-suppressed) ones.
+                if delta is not None:
+                    _set_attr(delta, "tool_calls", kept if kept else None)
+
+            # When the tool-call turn finishes, flush unwrapped arguments for any
+            # pending freeform tool calls before the finish chunk goes out.
+            if finish_reason == "tool_calls" and pending:
+                for idx, info in sorted(pending.items()):
+                    if info.get("emitted"):
+                        continue
+                    unwrapped = _unwrap_freeform_tool_arguments(info["buf"])
+                    if unwrapped is None:
+                        # Could not parse as {"input": ...}; fall back to raw buf.
+                        unwrapped = info["buf"]
+                    info["emitted"] = True
+                    yield _build_flush_chunk(
+                        chunk, _attr(choice, "index"), idx, info, unwrapped
+                    )
+                pending.clear()
+
+        yield chunk
+
+    # Safety net: if the stream ended without a finish_reason == "tool_calls"
+    # chunk (some providers split the finish marker out, or end abruptly),
+    # flush any still-pending freeform tool calls so their arguments are not lost.
+    for idx, info in sorted(pending.items()):
+        if info.get("emitted"):
+            continue
+        unwrapped = _unwrap_freeform_tool_arguments(info["buf"])
+        if unwrapped is None:
+            unwrapped = info["buf"]
+        info["emitted"] = True
+        yield _build_flush_chunk(last_chunk, 0, idx, info, unwrapped)
+
+
 def select_data_generator(
     response, user_api_key_dict: UserAPIKeyAuth, request_data: dict
 ):
+    freeform_tool_names = _get_cursor_freeform_tools(request_data)
+    if freeform_tool_names:
+        response = _unwrap_freeform_streaming_chunks(response, freeform_tool_names)
     return async_data_generator(
         response=response,
         user_api_key_dict=user_api_key_dict,
@@ -8461,12 +8612,23 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
 
         # Bare function_call / custom_tool_call item (no role): assistant tool invocation
         if item_type in ("function_call", "custom_tool_call") and role is None:
-            # custom_tool_call uses "input" (may be dict or string);
-            # function_call uses "arguments" (always string).
-            _args = item.get("arguments") or item.get("input") or "{}"
-            if not isinstance(_args, str):
-                import json as _json
-                _args = _json.dumps(_args)
+            import json as _json
+            if item_type == "custom_tool_call":
+                # Freeform/grammar custom tool (e.g. ApplyPatch): "input" is the
+                # raw text payload. We wrap freeform tools as a single-field JSON
+                # schema ({"input": <text>}) on the request side, so prior tool
+                # calls in history must use the same shape for consistency.
+                _raw = item.get("input")
+                if _raw is None:
+                    _raw = item.get("arguments", "")
+                if not isinstance(_raw, str):
+                    _raw = _json.dumps(_raw)
+                _args = _json.dumps({_FREEFORM_TOOL_ARG_KEY: _raw})
+            else:
+                # Standard function_call: "arguments" is already a JSON string.
+                _args = item.get("arguments") or "{}"
+                if not isinstance(_args, str):
+                    _args = _json.dumps(_args)
             intermediate.append({
                 "_type": "function_call",
                 "call_id": item.get("call_id", ""),
@@ -8598,7 +8760,16 @@ def _convert_responses_input_to_messages(input_list: list) -> list:
     return messages
 
 
-def _convert_responses_tools_to_chat_tools(tools: list) -> list:
+# Property name used to wrap a freeform/grammar custom tool's raw text input
+# into a single-field JSON schema. The model emits {"input": "<raw text>"} and
+# we unwrap it back to the raw text on the response side.
+_FREEFORM_TOOL_ARG_KEY = "input"
+
+
+def _convert_responses_tools_to_chat_tools(
+    tools: list,
+    freeform_tool_names: Optional[set] = None,
+) -> list:
     """
     Convert Responses API flat tool format to Chat Completions nested format.
 
@@ -8607,6 +8778,15 @@ def _convert_responses_tools_to_chat_tools(tools: list) -> list:
 
     Anthropic's mapper requires a "function" key for tools with type "function" or "custom".
     We wrap any such tool that is missing that key, regardless of whether "name" is present.
+
+    Freeform/grammar custom tools (Cursor's ApplyPatch — ``{"type": "custom",
+    "format": {"type": "grammar"|"text", ...}}``) expect their *raw text* as the
+    tool input, not a JSON object. LiteLLM/Anthropic cannot represent a native
+    freeform tool, so we wrap them as a JSON tool with a single string property
+    (``input``) and fold the grammar into the description. The model then emits
+    ``{"input": "<raw text>"}`` which we unwrap back to raw text on the way out.
+    Names of such tools are added to ``freeform_tool_names`` so the response side
+    knows which tool calls to unwrap.
     """
     # Tool types that Anthropic handles without needing a "function" wrapper.
     # These are passed through as-is.
@@ -8630,6 +8810,50 @@ def _convert_responses_tools_to_chat_tools(tools: list) -> list:
 
         tool_type = tool.get("type", "")
 
+        # Freeform / grammar custom tool (e.g. Cursor's ApplyPatch). The input
+        # is raw text, not JSON, so wrap it as a single-string-field function.
+        _fmt = tool.get("format")
+        if (
+            tool_type == "custom"
+            and isinstance(_fmt, dict)
+            and _fmt.get("type") in ("grammar", "text")
+        ):
+            _name = tool.get("name", "")
+            _desc = tool.get("description", "") or ""
+            # Surface the grammar definition in the description so the model
+            # knows the exact text format it must place inside the input field.
+            _grammar_def = _fmt.get("definition")
+            if _grammar_def:
+                _syntax = _fmt.get("syntax", "")
+                _desc = (
+                    f"{_desc}\n\nThe value of `{_FREEFORM_TOOL_ARG_KEY}` must be "
+                    f"the raw tool text (no JSON, no surrounding quotes) conforming "
+                    f"to this {_syntax} grammar:\n{_grammar_def}"
+                )
+            func_def = {
+                "name": _name,
+                "description": _desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        _FREEFORM_TOOL_ARG_KEY: {
+                            "type": "string",
+                            "description": (
+                                "The complete raw text payload for this tool, "
+                                "exactly as the tool's grammar/format requires."
+                            ),
+                        }
+                    },
+                    "required": [_FREEFORM_TOOL_ARG_KEY],
+                },
+            }
+            if "strict" in tool:
+                func_def["strict"] = tool["strict"]
+            converted.append({"type": "function", "function": func_def})
+            if freeform_tool_names is not None and _name:
+                freeform_tool_names.add(_name)
+            continue
+
         # Hosted / special tool types that don't use a "function" wrapper.
         if (
             tool_type in _PASS_THROUGH_EXACT
@@ -8642,7 +8866,7 @@ def _convert_responses_tools_to_chat_tools(tools: list) -> list:
         # Any remaining tool with type "function" or "custom" (and anything
         # else unrecognised) needs wrapping — even if "name" is absent.
         if tool_type in ("function", "custom") or tool_type == "":
-            func_def: dict = {}
+            func_def = {}
             for key in ("name", "description", "strict"):
                 if key in tool:
                     func_def[key] = tool[key]
@@ -8656,6 +8880,103 @@ def _convert_responses_tools_to_chat_tools(tools: list) -> list:
             converted.append(tool)
 
     return converted
+
+
+def _get_cursor_freeform_tools(request_data) -> set:
+    """Read the set of freeform tool names recorded for this request, if any."""
+    if not isinstance(request_data, dict):
+        return set()
+    meta = request_data.get("litellm_metadata")
+    if isinstance(meta, dict):
+        names = meta.get("cursor_freeform_tools")
+        if names:
+            return set(names)
+    return set()
+
+
+def _unwrap_freeform_tool_arguments(arguments: str) -> Optional[str]:
+    """
+    Given a tool-call ``arguments`` JSON string of the shape
+    ``{"input": "<raw text>"}`` (produced for a wrapped freeform/grammar tool),
+    return the raw inner text. Returns ``None`` if the arguments are not a
+    complete JSON object with the expected single key (e.g. partial streaming
+    fragments), so callers can leave them unchanged.
+    """
+    if not isinstance(arguments, str) or not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(parsed, dict) and _FREEFORM_TOOL_ARG_KEY in parsed:
+        value = parsed[_FREEFORM_TOOL_ARG_KEY]
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+    return None
+
+
+def _unwrap_freeform_tool_calls_in_response(
+    response, freeform_tool_names: set
+) -> None:
+    """
+    In-place unwrap of freeform tool-call arguments for a non-streaming
+    ChatCompletion response (either a litellm BaseModel or a plain dict).
+    """
+    if not freeform_tool_names:
+        return
+    try:
+        choices = (
+            response.choices
+            if hasattr(response, "choices")
+            else response.get("choices")
+        )
+    except Exception:
+        return
+    if not choices:
+        return
+    for choice in choices:
+        message = (
+            getattr(choice, "message", None)
+            if not isinstance(choice, dict)
+            else choice.get("message")
+        )
+        if message is None:
+            continue
+        tool_calls = (
+            getattr(message, "tool_calls", None)
+            if not isinstance(message, dict)
+            else message.get("tool_calls")
+        )
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            fn = (
+                getattr(tc, "function", None)
+                if not isinstance(tc, dict)
+                else tc.get("function")
+            )
+            if fn is None:
+                continue
+            name = (
+                getattr(fn, "name", None)
+                if not isinstance(fn, dict)
+                else fn.get("name")
+            )
+            if name not in freeform_tool_names:
+                continue
+            args = (
+                getattr(fn, "arguments", None)
+                if not isinstance(fn, dict)
+                else fn.get("arguments")
+            )
+            unwrapped = _unwrap_freeform_tool_arguments(args or "")
+            if unwrapped is None:
+                continue
+            if isinstance(fn, dict):
+                fn["arguments"] = unwrapped
+            else:
+                fn.arguments = unwrapped
 
 
 @router.post(
@@ -8779,23 +9100,20 @@ async def chat_completion(  # noqa: PLR0915
     # Must run for ALL requests (not just Responses API ones), because Cursor
     # can send flat tools even when messages are already in Chat Completions format.
     if isinstance(data, dict) and "tools" in data and isinstance(data["tools"], list):
-        # TEMP DIAGNOSTIC: dump the raw definition of any freeform/custom tool
-        # (e.g. Cursor's ApplyPatch) exactly as Cursor sends it, so we can see
-        # the expected input contract before transforming it. Remove after debug.
-        try:
-            import json as _json_dbg
-            for _t in data["tools"]:
-                if not isinstance(_t, dict):
-                    continue
-                _tname = _t.get("name") or (_t.get("function") or {}).get("name")
-                if _t.get("type") == "custom" or _tname == "ApplyPatch":
-                    verbose_proxy_logger.warning(
-                        "cursor_compat: raw custom tool definition: %s",
-                        _json_dbg.dumps(_t),
-                    )
-        except Exception:
-            pass
-        data["tools"] = _convert_responses_tools_to_chat_tools(data["tools"])
+        _freeform_tool_names: set = set()
+        data["tools"] = _convert_responses_tools_to_chat_tools(
+            data["tools"], freeform_tool_names=_freeform_tool_names
+        )
+        # Remember which tool calls must be unwrapped from {"input": "..."} back
+        # to raw text on the response side (Cursor freeform/grammar tools).
+        # Stored under litellm_metadata (a recognized internal field that is NOT
+        # forwarded to the provider) as a JSON-serializable list.
+        if _freeform_tool_names:
+            if not isinstance(data.get("litellm_metadata"), dict):
+                data["litellm_metadata"] = {}
+            data["litellm_metadata"]["cursor_freeform_tools"] = sorted(
+                _freeform_tool_names
+            )
 
     if user_api_key_dict is not None:
         if not isinstance(data.get("metadata"), dict):
@@ -8851,6 +9169,9 @@ async def chat_completion(  # noqa: PLR0915
             user_api_base=user_api_base,
             version=version,
         )
+        _freeform_tools = _get_cursor_freeform_tools(data)
+        if _freeform_tools and not isinstance(result, StreamingResponse):
+            _unwrap_freeform_tool_calls_in_response(result, _freeform_tools)
         if isinstance(result, BaseModel):
             return model_dump_with_preserved_fields(result, exclude_unset=True)
         else:
